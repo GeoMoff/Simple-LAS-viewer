@@ -2,7 +2,7 @@
 
 A browser-based LAS point cloud viewer built with React and Three.js. Supports EPSG:4326 (WGS84) coordinate systems with elevation in meters.
 
-![LAS Viewer Screenshot](screenshot.png)
+![LAS Viewer Screenshot](screenshot.PNG)
 
 ## Features
 
