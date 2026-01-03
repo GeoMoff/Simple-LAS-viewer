@@ -2,6 +2,12 @@
 
 A browser-based LAS point cloud viewer built with React and Three.js. Supports EPSG:4326 (WGS84) coordinate systems with elevation in meters.
 
+## 🚀 Try It Now
+
+**[Launch Live Viewer](https://geomoff.github.io/Simple-LAS-viewer/)**
+
+Don't have a LAS file? Try the [sample file](https://github.com/GeoMoff/Simple-LAS-viewer/blob/main/Scan%203.las) - just download it and drag it into the viewer!
+
 ![LAS Viewer Screenshot](screenshot.png)
 
 ## Features
@@ -47,9 +53,9 @@ A browser-based LAS point cloud viewer built with React and Three.js. Supports E
 
 ### Option 1: Standalone HTML (No Build Required)
 
-Simply open `index.standalone.html` in any modern browser. This works directly from the repository without any installation - just download and open!
+Simply open `index.html` in any modern browser. This works directly from the repository without any installation - just download and open!
 
-This is also compatible with GitHub Pages - just rename to `index.html` and enable Pages in your repo settings.
+Alternatively, use the [live viewer](https://geomoff.github.io/Simple-LAS-viewer/) hosted on GitHub Pages.
 
 ### Option 2: Development Build
 
