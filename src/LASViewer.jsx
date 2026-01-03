@@ -1,0 +1,1554 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import * as THREE from 'three';
+
+// LAS Parser with EPSG:4326 support (lat/lon degrees + meters elevation)
+class LASParser {
+  constructor(arrayBuffer, options = {}) {
+    this.buffer = arrayBuffer;
+    this.view = new DataView(arrayBuffer);
+    this.header = {};
+    this.isGeographic = options.isGeographic !== false;
+  }
+
+  parse() {
+    this.parseHeader();
+    const points = this.parsePoints();
+    return { header: this.header, points };
+  }
+
+  parseHeader() {
+    const view = this.view;
+    
+    const signature = String.fromCharCode(
+      view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)
+    );
+    
+    if (signature !== 'LASF') {
+      throw new Error('Invalid LAS file signature: ' + signature);
+    }
+
+    const versionMajor = view.getUint8(24);
+    const versionMinor = view.getUint8(25);
+    const headerSize = view.getUint16(94, true);
+    const offsetToPointData = view.getUint32(96, true);
+    const pointDataRecordFormat = view.getUint8(104);
+    const pointDataRecordLength = view.getUint16(105, true);
+    const legacyNumberOfPoints = view.getUint32(107, true);
+
+    const scaleX = view.getFloat64(131, true);
+    const scaleY = view.getFloat64(139, true);
+    const scaleZ = view.getFloat64(147, true);
+    const offsetX = view.getFloat64(155, true);
+    const offsetY = view.getFloat64(163, true);
+    const offsetZ = view.getFloat64(171, true);
+
+    let numberOfPoints = legacyNumberOfPoints;
+    if (versionMajor >= 1 && versionMinor >= 4 && headerSize >= 375) {
+      const low = view.getUint32(247, true);
+      const high = view.getUint32(251, true);
+      const count64 = low + high * 0x100000000;
+      if (count64 > 0) numberOfPoints = count64;
+    }
+
+    this.header = {
+      signature, versionMajor, versionMinor, headerSize,
+      offsetToPointData, pointDataRecordFormat, pointDataRecordLength,
+      numberOfPoints, scaleX, scaleY, scaleZ, offsetX, offsetY, offsetZ
+    };
+  }
+
+  parsePoints() {
+    const h = this.header;
+    const view = this.view;
+    const format = h.pointDataRecordFormat;
+    
+    let hasRGB = false, rgbOffset = 0;
+    if (format === 2) { hasRGB = true; rgbOffset = 20; }
+    else if (format === 3 || format === 5) { hasRGB = true; rgbOffset = 28; }
+    else if (format === 7 || format === 8 || format === 10) { hasRGB = true; rgbOffset = 30; }
+
+    const maxPoints = 2000000;
+    const totalPoints = h.numberOfPoints;
+    const step = totalPoints > maxPoints ? Math.ceil(totalPoints / maxPoints) : 1;
+    const recordLen = h.pointDataRecordLength;
+
+    const rawPoints = [];
+    let minLon = Infinity, maxLon = -Infinity;
+    let minLat = Infinity, maxLat = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+
+    for (let i = 0; i < totalPoints; i += step) {
+      const offset = h.offsetToPointData + i * recordLen;
+      if (offset + 12 > this.buffer.byteLength) break;
+
+      const rawX = view.getInt32(offset, true);
+      const rawY = view.getInt32(offset + 4, true);
+      const rawZ = view.getInt32(offset + 8, true);
+
+      const lon = rawX * h.scaleX + h.offsetX;
+      const lat = rawY * h.scaleY + h.offsetY;
+      const z = rawZ * h.scaleZ + h.offsetZ;
+
+      rawPoints.push({ lon, lat, z, offset });
+
+      if (lon < minLon) minLon = lon;
+      if (lon > maxLon) maxLon = lon;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+
+    const centerLon = (minLon + maxLon) / 2;
+    const centerLat = (minLat + maxLat) / 2;
+    const centerZ = (minZ + maxZ) / 2;
+
+    const DEG_TO_RAD = Math.PI / 180;
+    const metersPerDegreeLat = 111320;
+    const metersPerDegreeLon = 111320 * Math.cos(centerLat * DEG_TO_RAD);
+
+    const numPoints = rawPoints.length;
+    const positions = new Float32Array(numPoints * 3);
+    const colors = new Float32Array(numPoints * 3);
+    const zRange = maxZ - minZ || 1;
+
+    for (let i = 0; i < numPoints; i++) {
+      const pt = rawPoints[i];
+      const idx = i * 3;
+
+      // X = East (longitude), Y = North (latitude), Z = Up (elevation)
+      const xMeters = (pt.lon - centerLon) * metersPerDegreeLon;
+      const yMeters = (pt.lat - centerLat) * metersPerDegreeLat;
+      const zMeters = pt.z - centerZ;
+
+      positions[idx] = xMeters;
+      positions[idx + 1] = yMeters;
+      positions[idx + 2] = zMeters;
+
+      let r = 0.5, g = 0.5, b = 0.5;
+
+      if (hasRGB && pt.offset + rgbOffset + 6 <= this.buffer.byteLength) {
+        const red = view.getUint16(pt.offset + rgbOffset, true);
+        const green = view.getUint16(pt.offset + rgbOffset + 2, true);
+        const blue = view.getUint16(pt.offset + rgbOffset + 4, true);
+
+        if (red > 255 || green > 255 || blue > 255) {
+          r = red / 65535; g = green / 65535; b = blue / 65535;
+        } else if (red > 0 || green > 0 || blue > 0) {
+          r = red / 255; g = green / 255; b = blue / 255;
+        }
+
+        if (r === 0 && g === 0 && b === 0) {
+          const t = (pt.z - minZ) / zRange;
+          const c = elevationColor(t);
+          r = c.r; g = c.g; b = c.b;
+        }
+      } else {
+        const t = (pt.z - minZ) / zRange;
+        const c = elevationColor(t);
+        r = c.r; g = c.g; b = c.b;
+      }
+
+      colors[idx] = r;
+      colors[idx + 1] = g;
+      colors[idx + 2] = b;
+    }
+
+    const extentX = (maxLon - minLon) * metersPerDegreeLon;
+    const extentY = (maxLat - minLat) * metersPerDegreeLat;
+    const extentZ = maxZ - minZ;
+
+    this.header.loadedPoints = numPoints;
+    this.header.bounds = { lon: [minLon, maxLon], lat: [minLat, maxLat], z: [minZ, maxZ] };
+    this.header.center = { lon: centerLon, lat: centerLat, z: centerZ };
+    this.header.extentMeters = { x: extentX, y: extentY, z: extentZ };
+
+    return { positions, colors };
+  }
+}
+
+function elevationColor(t) {
+  t = Math.max(0, Math.min(1, t));
+  let r, g, b;
+  if (t < 0.25) {
+    r = 0; g = t * 4; b = 1;
+  } else if (t < 0.5) {
+    r = 0; g = 1; b = 1 - (t - 0.25) * 4;
+  } else if (t < 0.75) {
+    r = (t - 0.5) * 4; g = 1; b = 0;
+  } else {
+    r = 1; g = 1 - (t - 0.75) * 4; b = 0;
+  }
+  return { r, g, b };
+}
+
+// Orbit controls for Z-up coordinate system
+class OrbitControls {
+  constructor(camera, element) {
+    this.camera = camera;
+    this.element = element;
+    this.target = new THREE.Vector3(0, 0, 0);
+    this.distance = 100;
+    
+    // Azimuth angle (rotation around Z axis, 0 = looking from +X direction)
+    this.azimuth = Math.PI / 4;
+    // Elevation angle (0 = horizontal, PI/2 = looking straight down from above)
+    this.elevation = Math.PI / 4;
+    
+    this.dragging = false;
+    this.panning = false;
+    this.lastX = 0;
+    this.lastY = 0;
+    
+    // Sensitivity
+    this.rotateSensitivity = 0.003;
+    this.panSensitivity = 0.0008;
+    this.zoomSensitivity = 0.08;
+
+    // Set camera up vector to Z
+    this.camera.up.set(0, 0, 1);
+
+    this.onMouseDown = this.onMouseDown.bind(this);
+    this.onMouseMove = this.onMouseMove.bind(this);
+    this.onMouseUp = this.onMouseUp.bind(this);
+    this.onWheel = this.onWheel.bind(this);
+
+    element.addEventListener('mousedown', this.onMouseDown);
+    element.addEventListener('mousemove', this.onMouseMove);
+    element.addEventListener('mouseup', this.onMouseUp);
+    element.addEventListener('mouseleave', this.onMouseUp);
+    element.addEventListener('wheel', this.onWheel, { passive: false });
+    element.addEventListener('contextmenu', e => e.preventDefault());
+
+    this.update();
+  }
+
+  onMouseDown(e) {
+    if (e.button === 0) this.dragging = true;
+    else if (e.button === 2) this.panning = true;
+    this.lastX = e.clientX;
+    this.lastY = e.clientY;
+  }
+
+  onMouseMove(e) {
+    const dx = e.clientX - this.lastX;
+    const dy = e.clientY - this.lastY;
+    this.lastX = e.clientX;
+    this.lastY = e.clientY;
+
+    if (this.dragging) {
+      // Horizontal drag rotates azimuth
+      this.azimuth -= dx * this.rotateSensitivity;
+      // Vertical drag changes elevation (clamped to avoid flipping)
+      this.elevation = Math.max(-Math.PI / 3, Math.min(Math.PI / 2 - 0.05, this.elevation + dy * this.rotateSensitivity));
+      this.update();
+    } else if (this.panning) {
+      // Pan in the XY plane (ground plane)
+      const panSpeed = this.distance * this.panSensitivity;
+      
+      // Get right vector (perpendicular to view direction in XY plane)
+      const rightX = Math.sin(this.azimuth);
+      const rightY = -Math.cos(this.azimuth);
+      
+      // Get forward vector (in XY plane)
+      const forwardX = Math.cos(this.azimuth);
+      const forwardY = Math.sin(this.azimuth);
+      
+      this.target.x += (-dx * rightX + dy * forwardX) * panSpeed;
+      this.target.y += (-dx * rightY + dy * forwardY) * panSpeed;
+      this.update();
+    }
+  }
+
+  onMouseUp() {
+    this.dragging = false;
+    this.panning = false;
+  }
+
+  onWheel(e) {
+    e.preventDefault();
+    const factor = 1 + (e.deltaY > 0 ? this.zoomSensitivity : -this.zoomSensitivity);
+    this.distance = Math.max(0.1, Math.min(100000, this.distance * factor));
+    this.update();
+  }
+
+  update() {
+    // Calculate camera position using Z-up spherical coordinates
+    // elevation: 0 = horizontal, PI/2 = straight down from above
+    const cosEl = Math.cos(this.elevation);
+    const sinEl = Math.sin(this.elevation);
+    
+    const x = this.target.x + this.distance * cosEl * Math.cos(this.azimuth);
+    const y = this.target.y + this.distance * cosEl * Math.sin(this.azimuth);
+    const z = this.target.z + this.distance * sinEl;
+    
+    this.camera.position.set(x, y, z);
+    this.camera.lookAt(this.target);
+  }
+
+  setDistance(d) {
+    this.distance = d;
+    this.update();
+  }
+
+  reset(extent) {
+    this.target.set(0, 0, 0);
+    this.azimuth = Math.PI * 0.75; // Looking from SW
+    this.elevation = Math.PI / 6;  // 30 degrees above horizontal
+    this.setDistance(extent * 1.5);
+  }
+
+  // View presets for Z-up system
+  viewTop() {
+    this.azimuth = 0;
+    this.elevation = Math.PI / 2 - 0.01; // Almost straight down
+    this.target.set(0, 0, 0);
+    this.update();
+  }
+
+  viewFront() {
+    // Looking from South toward North (camera at -Y)
+    this.azimuth = -Math.PI / 2;
+    this.elevation = 0.01; // Nearly horizontal
+    this.target.set(0, 0, 0);
+    this.update();
+  }
+
+  viewRight() {
+    // Looking from West toward East (camera at -X)
+    this.azimuth = Math.PI;
+    this.elevation = 0.01;
+    this.target.set(0, 0, 0);
+    this.update();
+  }
+
+  viewIsometric() {
+    this.azimuth = Math.PI * 0.75; // From SW
+    this.elevation = Math.PI / 6;  // 30 degrees up
+    this.target.set(0, 0, 0);
+    this.update();
+  }
+
+  // Incremental rotations
+  rotateLeft() {
+    this.azimuth += Math.PI / 8;
+    this.update();
+  }
+
+  rotateRight() {
+    this.azimuth -= Math.PI / 8;
+    this.update();
+  }
+
+  rotateUp() {
+    this.elevation = Math.min(Math.PI / 2 - 0.05, this.elevation + Math.PI / 16);
+    this.update();
+  }
+
+  rotateDown() {
+    this.elevation = Math.max(-Math.PI / 3, this.elevation - Math.PI / 16);
+    this.update();
+  }
+
+  dispose() {
+    this.element.removeEventListener('mousedown', this.onMouseDown);
+    this.element.removeEventListener('mousemove', this.onMouseMove);
+    this.element.removeEventListener('mouseup', this.onMouseUp);
+    this.element.removeEventListener('mouseleave', this.onMouseUp);
+    this.element.removeEventListener('wheel', this.onWheel);
+  }
+}
+
+export default function LASViewer() {
+  const containerRef = useRef(null);
+  const threeRef = useRef({});
+
+  const [fileInfo, setFileInfo] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [pointSize, setPointSize] = useState(2.0);
+  const [opacity, setOpacity] = useState(100);
+  const [measureMode, setMeasureMode] = useState(false);
+  const [measurePoints, setMeasurePoints] = useState([]);
+  const [measureDistance, setMeasureDistance] = useState(null);
+  const [measureAxis, setMeasureAxis] = useState('3d'); // '3d', 'horizontal', 'vertical'
+  
+  // Slicer state - all three axes work together
+  const [sliceEnabled, setSliceEnabled] = useState(false);
+  const [sliceX, setSliceX] = useState({ min: 0, max: 100 });
+  const [sliceY, setSliceY] = useState({ min: 0, max: 100 });
+  const [sliceZ, setSliceZ] = useState({ min: 0, max: 100 });
+  const [sliceBoundsX, setSliceBoundsX] = useState({ min: 0, max: 100 });
+  const [sliceBoundsY, setSliceBoundsY] = useState({ min: 0, max: 100 });
+  const [sliceBoundsZ, setSliceBoundsZ] = useState({ min: 0, max: 100 });
+  
+  // Display options
+  const [darkBackground, setDarkBackground] = useState(true);
+  const [pointColor, setPointColor] = useState('original'); // 'original' or color hex
+  const [rotationZ, setRotationZ] = useState(0); // Rotation around Z axis in degrees
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 100000);
+    camera.up.set(0, 0, 1); // Z is up
+    
+    const renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(1);
+    container.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+
+    // Create a group to hold data that can be rotated together
+    const dataGroup = new THREE.Group();
+    scene.add(dataGroup);
+
+    // Ground grid on XY plane (Z = 0)
+    const grid = new THREE.GridHelper(100, 20, 0x444466, 0x333344);
+    grid.rotation.x = Math.PI / 2; // Rotate to XY plane
+    dataGroup.add(grid);
+
+    // Axes: X = red (East), Y = green (North), Z = blue (Up)
+    const axes = new THREE.AxesHelper(50);
+    dataGroup.add(axes);
+
+    threeRef.current = { renderer, scene, camera, controls, grid, axes, dataGroup, measureLine: null, measureMarkers: [], measureCylinder: null };
+
+    const animate = () => {
+      threeRef.current.animId = requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    const handleResize = () => {
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    };
+    window.addEventListener('resize', handleResize);
+
+    // Keyboard controls for panning
+    const handleKeyDown = (e) => {
+      if (!threeRef.current.controls) return;
+      const controls = threeRef.current.controls;
+      const panAmount = controls.distance * 0.05;
+      
+      // Get right vector based on current azimuth (for left/right)
+      const rightX = Math.sin(controls.azimuth);
+      const rightY = -Math.cos(controls.azimuth);
+      
+      switch (e.key) {
+        case 'ArrowLeft':
+          controls.target.x += rightX * panAmount;
+          controls.target.y += rightY * panAmount;
+          controls.update();
+          e.preventDefault();
+          break;
+        case 'ArrowRight':
+          controls.target.x -= rightX * panAmount;
+          controls.target.y -= rightY * panAmount;
+          controls.update();
+          e.preventDefault();
+          break;
+        case 'ArrowUp':
+          // Move up along Z axis
+          controls.target.z += panAmount;
+          controls.update();
+          e.preventDefault();
+          break;
+        case 'ArrowDown':
+          // Move down along Z axis
+          controls.target.z -= panAmount;
+          controls.update();
+          e.preventDefault();
+          break;
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('keydown', handleKeyDown);
+      cancelAnimationFrame(threeRef.current.animId);
+      controls.dispose();
+      renderer.dispose();
+      if (container.contains(renderer.domElement)) {
+        container.removeChild(renderer.domElement);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (threeRef.current.points) {
+      threeRef.current.points.material.size = pointSize;
+    }
+  }, [pointSize]);
+
+  useEffect(() => {
+    if (threeRef.current.points) {
+      threeRef.current.points.material.opacity = opacity / 100;
+    }
+  }, [opacity]);
+
+  // Update background color
+  useEffect(() => {
+    if (threeRef.current.scene) {
+      threeRef.current.scene.background = new THREE.Color(darkBackground ? 0x1a1a2e : 0xffffff);
+      
+      // Update grid color to contrast with background
+      if (threeRef.current.grid) {
+        const gridColor = darkBackground ? 0x444466 : 0xcccccc;
+        const gridColorCenter = darkBackground ? 0x333344 : 0xdddddd;
+        threeRef.current.grid.material.color.setHex(gridColor);
+        if (threeRef.current.grid.material.length) {
+          threeRef.current.grid.material[0].color.setHex(gridColorCenter);
+          threeRef.current.grid.material[1].color.setHex(gridColor);
+        }
+      }
+    }
+  }, [darkBackground]);
+
+  // Update point colors
+  useEffect(() => {
+    if (!threeRef.current.points || !threeRef.current.originalColors) return;
+    
+    const geometry = threeRef.current.points.geometry;
+    const originalColors = threeRef.current.originalColors;
+    
+    if (pointColor === 'original') {
+      // Restore original colors (but respect current slice)
+      if (sliceEnabled) {
+        // Let the slice effect handle it
+        return;
+      }
+      geometry.setAttribute('color', new THREE.BufferAttribute(originalColors.slice(), 3));
+    } else {
+      // Apply solid color
+      const color = new THREE.Color(pointColor);
+      const positions = geometry.attributes.position.array;
+      const numPoints = positions.length / 3;
+      const newColors = new Float32Array(numPoints * 3);
+      
+      for (let i = 0; i < numPoints; i++) {
+        newColors[i * 3] = color.r;
+        newColors[i * 3 + 1] = color.g;
+        newColors[i * 3 + 2] = color.b;
+      }
+      
+      geometry.setAttribute('color', new THREE.BufferAttribute(newColors, 3));
+    }
+    geometry.attributes.color.needsUpdate = true;
+  }, [pointColor, sliceEnabled]);
+
+  // Apply rotation to points only (not grid/axes)
+  useEffect(() => {
+    if (threeRef.current.points) {
+      threeRef.current.points.rotation.z = (rotationZ * Math.PI) / 180;
+    }
+    
+    // Recalculate world-space bounds when rotation changes
+    if (threeRef.current.originalPositions) {
+      const positions = threeRef.current.originalPositions;
+      const rotRad = (rotationZ * Math.PI) / 180;
+      const cosR = Math.cos(rotRad);
+      const sinR = Math.sin(rotRad);
+      
+      let minX = Infinity, maxX = -Infinity;
+      let minY = Infinity, maxY = -Infinity;
+      let minZ = Infinity, maxZ = -Infinity;
+      
+      for (let i = 0; i < positions.length; i += 3) {
+        const localX = positions[i];
+        const localY = positions[i + 1];
+        const localZ = positions[i + 2];
+        
+        // Transform to world coordinates
+        const worldX = localX * cosR - localY * sinR;
+        const worldY = localX * sinR + localY * cosR;
+        const worldZ = localZ;
+        
+        if (worldX < minX) minX = worldX;
+        if (worldX > maxX) maxX = worldX;
+        if (worldY < minY) minY = worldY;
+        if (worldY > maxY) maxY = worldY;
+        if (worldZ < minZ) minZ = worldZ;
+        if (worldZ > maxZ) maxZ = worldZ;
+      }
+      
+      setSliceBoundsX({ min: minX, max: maxX });
+      setSliceBoundsY({ min: minY, max: maxY });
+      setSliceBoundsZ({ min: minZ, max: maxZ });
+    }
+  }, [rotationZ]);
+
+  // Handle measurement clicks
+  const handleMeasureClick = useCallback((event) => {
+    if (!measureMode || !threeRef.current.points) return;
+
+    const container = containerRef.current;
+    const rect = container.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    const y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    const { camera, scene, points } = threeRef.current;
+    
+    // Raycaster to find closest point
+    const raycaster = new THREE.Raycaster();
+    // Set threshold based on point cloud extent for better picking
+    const threshold = fileInfo ? Math.max(fileInfo.extentMeters.x, fileInfo.extentMeters.y, fileInfo.extentMeters.z) * 0.01 : 2;
+    raycaster.params.Points.threshold = threshold;
+    raycaster.setFromCamera(new THREE.Vector2(x, y), camera);
+
+    const intersects = raycaster.intersectObject(points);
+    
+    if (intersects.length > 0) {
+      const point = intersects[0].point.clone();
+      
+      if (measurePoints.length === 0) {
+        // First point
+        setMeasurePoints([point]);
+        setMeasureDistance(null);
+        
+        // Clear old measurement visuals
+        clearMeasurementVisuals();
+        
+        // Add marker for first point
+        addMeasureMarker(point, 0x00ff00);
+      } else if (measurePoints.length === 1) {
+        // Second point - calculate distance
+        const p1 = measurePoints[0];
+        const p2 = point;
+        
+        let dist;
+        if (measureAxis === 'horizontal') {
+          // XY plane distance only
+          dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+        } else if (measureAxis === 'vertical') {
+          // Z axis distance only
+          dist = Math.abs(p2.z - p1.z);
+        } else {
+          // Full 3D distance
+          dist = p1.distanceTo(p2);
+        }
+        
+        setMeasurePoints([p1, p2]);
+        setMeasureDistance(dist);
+        
+        // Add marker for second point
+        addMeasureMarker(point, 0xff0000);
+        
+        // Draw line between points
+        drawMeasureLine(p1, p2);
+      } else {
+        // Reset and start new measurement
+        clearMeasurementVisuals();
+        setMeasurePoints([point]);
+        setMeasureDistance(null);
+        addMeasureMarker(point, 0x00ff00);
+      }
+    }
+  }, [measureMode, measurePoints, fileInfo, measureAxis]);
+
+  const addMeasureMarker = (position, color) => {
+    const { scene } = threeRef.current;
+    const geometry = new THREE.SphereGeometry(0.5, 16, 16);
+    const material = new THREE.MeshBasicMaterial({ color });
+    const marker = new THREE.Mesh(geometry, material);
+    marker.position.copy(position);
+    
+    // Scale marker based on scene size - make them small
+    if (fileInfo) {
+      const ext = fileInfo.extentMeters;
+      const maxExtent = Math.max(ext.x, ext.y, ext.z);
+      marker.scale.setScalar(maxExtent * 0.005);
+    }
+    
+    scene.add(marker);
+    threeRef.current.measureMarkers.push(marker);
+  };
+
+  const drawMeasureLine = (p1, p2) => {
+    const { scene } = threeRef.current;
+    
+    // Remove old line if exists
+    if (threeRef.current.measureLine) {
+      scene.remove(threeRef.current.measureLine);
+      threeRef.current.measureLine.geometry.dispose();
+      threeRef.current.measureLine.material.dispose();
+    }
+    
+    // Remove old cylinder if exists
+    if (threeRef.current.measureCylinder) {
+      scene.remove(threeRef.current.measureCylinder);
+      threeRef.current.measureCylinder.geometry.dispose();
+      threeRef.current.measureCylinder.material.dispose();
+    }
+    
+    // Create line points based on axis mode
+    let linePoints;
+    let lineColor = 0xffff00; // Default yellow
+    
+    if (measureAxis === 'horizontal') {
+      // Project to same Z level (use p1's Z)
+      const p2Projected = new THREE.Vector3(p2.x, p2.y, p1.z);
+      linePoints = [p1, p2Projected];
+      lineColor = 0x00ffff; // Cyan for horizontal
+    } else if (measureAxis === 'vertical') {
+      // Vertical line at p1's XY position
+      const p2Projected = new THREE.Vector3(p1.x, p1.y, p2.z);
+      linePoints = [p1, p2Projected];
+      lineColor = 0xff00ff; // Magenta for vertical
+    } else {
+      linePoints = [p1, p2];
+    }
+    
+    const geometry = new THREE.BufferGeometry().setFromPoints(linePoints);
+    const material = new THREE.LineBasicMaterial({ 
+      color: lineColor, 
+      linewidth: 6,
+      depthTest: false 
+    });
+    const line = new THREE.Line(geometry, material);
+    line.renderOrder = 999;
+    scene.add(line);
+    threeRef.current.measureLine = line;
+    
+    // Add a thicker cylinder for better visibility (LineBasicMaterial linewidth often ignored)
+    const direction = new THREE.Vector3().subVectors(linePoints[1], linePoints[0]);
+    const length = direction.length();
+    if (length > 0) {
+      const cylinderGeom = new THREE.CylinderGeometry(
+        fileInfo ? Math.max(fileInfo.extentMeters.x, fileInfo.extentMeters.y, fileInfo.extentMeters.z) * 0.002 : 0.1,
+        fileInfo ? Math.max(fileInfo.extentMeters.x, fileInfo.extentMeters.y, fileInfo.extentMeters.z) * 0.002 : 0.1,
+        length,
+        8
+      );
+      const cylinderMat = new THREE.MeshBasicMaterial({ color: lineColor, transparent: true, opacity: 0.8 });
+      const cylinder = new THREE.Mesh(cylinderGeom, cylinderMat);
+      
+      // Position at midpoint
+      const midpoint = new THREE.Vector3().addVectors(linePoints[0], linePoints[1]).multiplyScalar(0.5);
+      cylinder.position.copy(midpoint);
+      
+      // Align to direction
+      cylinder.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
+      cylinder.renderOrder = 998;
+      
+      scene.add(cylinder);
+      threeRef.current.measureCylinder = cylinder;
+    }
+  };
+
+  const clearMeasurementVisuals = () => {
+    const { scene, measureLine, measureMarkers, measureCylinder } = threeRef.current;
+    
+    if (measureLine) {
+      scene.remove(measureLine);
+      measureLine.geometry.dispose();
+      measureLine.material.dispose();
+      threeRef.current.measureLine = null;
+    }
+    
+    if (measureCylinder) {
+      scene.remove(measureCylinder);
+      measureCylinder.geometry.dispose();
+      measureCylinder.material.dispose();
+      threeRef.current.measureCylinder = null;
+    }
+    
+    measureMarkers.forEach(marker => {
+      scene.remove(marker);
+      marker.geometry.dispose();
+      marker.material.dispose();
+    });
+    threeRef.current.measureMarkers = [];
+  };
+
+  const clearMeasurement = () => {
+    clearMeasurementVisuals();
+    setMeasurePoints([]);
+    setMeasureDistance(null);
+  };
+
+  const toggleMeasureMode = () => {
+    if (measureMode) {
+      // Turning off - clear everything
+      clearMeasurement();
+    }
+    setMeasureMode(!measureMode);
+  };
+
+  // Recalculate measurement when axis mode changes
+  useEffect(() => {
+    if (measurePoints.length === 2) {
+      const p1 = measurePoints[0];
+      const p2 = measurePoints[1];
+      
+      let dist;
+      if (measureAxis === 'horizontal') {
+        dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+      } else if (measureAxis === 'vertical') {
+        dist = Math.abs(p2.z - p1.z);
+      } else {
+        dist = p1.distanceTo(p2);
+      }
+      
+      setMeasureDistance(dist);
+      drawMeasureLine(p1, p2);
+    }
+  }, [measureAxis]);
+
+  // Apply slicer to point cloud - all three axes combined, in world coordinates
+  useEffect(() => {
+    if (!threeRef.current.points || !threeRef.current.originalPositions) return;
+    
+    const geometry = threeRef.current.points.geometry;
+    const originalPositions = threeRef.current.originalPositions;
+    const originalColors = threeRef.current.originalColors;
+    
+    if (!sliceEnabled) {
+      // Restore all points
+      geometry.setAttribute('position', new THREE.BufferAttribute(originalPositions.slice(), 3));
+      
+      // Apply appropriate colors
+      if (pointColor === 'original') {
+        geometry.setAttribute('color', new THREE.BufferAttribute(originalColors.slice(), 3));
+      } else {
+        const color = new THREE.Color(pointColor);
+        const numPoints = originalPositions.length / 3;
+        const newColors = new Float32Array(numPoints * 3);
+        for (let i = 0; i < numPoints; i++) {
+          newColors[i * 3] = color.r;
+          newColors[i * 3 + 1] = color.g;
+          newColors[i * 3 + 2] = color.b;
+        }
+        geometry.setAttribute('color', new THREE.BufferAttribute(newColors, 3));
+      }
+      
+      geometry.attributes.position.needsUpdate = true;
+      geometry.attributes.color.needsUpdate = true;
+      return;
+    }
+    
+    // Calculate actual bounds for each axis (in world/scene coordinates)
+    const xMin = sliceBoundsX.min + (sliceX.min / 100) * (sliceBoundsX.max - sliceBoundsX.min);
+    const xMax = sliceBoundsX.min + (sliceX.max / 100) * (sliceBoundsX.max - sliceBoundsX.min);
+    const yMin = sliceBoundsY.min + (sliceY.min / 100) * (sliceBoundsY.max - sliceBoundsY.min);
+    const yMax = sliceBoundsY.min + (sliceY.max / 100) * (sliceBoundsY.max - sliceBoundsY.min);
+    const zMin = sliceBoundsZ.min + (sliceZ.min / 100) * (sliceBoundsZ.max - sliceBoundsZ.min);
+    const zMax = sliceBoundsZ.min + (sliceZ.max / 100) * (sliceBoundsZ.max - sliceBoundsZ.min);
+    
+    // Get rotation in radians
+    const rotRad = (rotationZ * Math.PI) / 180;
+    const cosR = Math.cos(rotRad);
+    const sinR = Math.sin(rotRad);
+    
+    const filteredPositions = [];
+    const filteredColors = [];
+    
+    const solidColor = pointColor !== 'original' ? new THREE.Color(pointColor) : null;
+    
+    for (let i = 0; i < originalPositions.length / 3; i++) {
+      const localX = originalPositions[i * 3];
+      const localY = originalPositions[i * 3 + 1];
+      const localZ = originalPositions[i * 3 + 2];
+      
+      // Transform to world coordinates (apply Z rotation)
+      const worldX = localX * cosR - localY * sinR;
+      const worldY = localX * sinR + localY * cosR;
+      const worldZ = localZ; // Z unchanged when rotating around Z axis
+      
+      // Check all three axes in world coordinates
+      if (worldX >= xMin && worldX <= xMax && worldY >= yMin && worldY <= yMax && worldZ >= zMin && worldZ <= zMax) {
+        // Store local coordinates (Three.js will apply rotation when rendering)
+        filteredPositions.push(localX, localY, localZ);
+        
+        if (solidColor) {
+          filteredColors.push(solidColor.r, solidColor.g, solidColor.b);
+        } else {
+          filteredColors.push(
+            originalColors[i * 3],
+            originalColors[i * 3 + 1],
+            originalColors[i * 3 + 2]
+          );
+        }
+      }
+    }
+    
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(filteredPositions), 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(filteredColors), 3));
+    geometry.attributes.position.needsUpdate = true;
+    geometry.attributes.color.needsUpdate = true;
+    geometry.computeBoundingBox();
+  }, [sliceEnabled, sliceX, sliceY, sliceZ, sliceBoundsX, sliceBoundsY, sliceBoundsZ, pointColor, rotationZ]);
+
+  const loadFile = useCallback(async (file) => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const parser = new LASParser(buffer, { isGeographic: true });
+      const data = parser.parse();
+
+      const { scene, camera, controls, grid, axes, dataGroup } = threeRef.current;
+
+      if (threeRef.current.points) {
+        dataGroup.remove(threeRef.current.points);
+        threeRef.current.points.geometry.dispose();
+        threeRef.current.points.material.dispose();
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(data.points.positions, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(data.points.colors, 3));
+
+      // Store original data for slicer
+      threeRef.current.originalPositions = data.points.positions.slice();
+      threeRef.current.originalColors = data.points.colors.slice();
+
+      const material = new THREE.PointsMaterial({
+        size: pointSize,
+        vertexColors: true,
+        sizeAttenuation: false,
+        transparent: true,
+        opacity: opacity / 100
+      });
+
+      const points = new THREE.Points(geometry, material);
+      dataGroup.add(points);
+      threeRef.current.points = points;
+
+      const ext = data.header.extentMeters;
+      const maxExtent = Math.max(ext.x, ext.y, ext.z);
+
+      camera.near = maxExtent * 0.0001;
+      camera.far = maxExtent * 100;
+      camera.updateProjectionMatrix();
+
+      // Update grid to match data extent, positioned at Z = 0 (bottom of data)
+      dataGroup.remove(grid);
+      dataGroup.remove(axes);
+      
+      const gridSize = Math.max(ext.x, ext.y) * 1.5;
+      const newGrid = new THREE.GridHelper(gridSize, 20, 0x444466, 0x333344);
+      newGrid.rotation.x = Math.PI / 2; // XY plane
+      newGrid.position.z = -ext.z / 2;  // At bottom of point cloud
+      dataGroup.add(newGrid);
+      
+      const newAxes = new THREE.AxesHelper(maxExtent * 0.3);
+      newAxes.position.z = -ext.z / 2;
+      dataGroup.add(newAxes);
+      
+      threeRef.current.grid = newGrid;
+      threeRef.current.axes = newAxes;
+
+      controls.reset(maxExtent);
+
+      // Calculate and set slice bounds based on extent
+      const positions = data.points.positions;
+      let minX = Infinity, maxX = -Infinity;
+      let minY = Infinity, maxY = -Infinity;
+      let minZ = Infinity, maxZ = -Infinity;
+      
+      for (let i = 0; i < positions.length; i += 3) {
+        if (positions[i] < minX) minX = positions[i];
+        if (positions[i] > maxX) maxX = positions[i];
+        if (positions[i + 1] < minY) minY = positions[i + 1];
+        if (positions[i + 1] > maxY) maxY = positions[i + 1];
+        if (positions[i + 2] < minZ) minZ = positions[i + 2];
+        if (positions[i + 2] > maxZ) maxZ = positions[i + 2];
+      }
+      
+      threeRef.current.dataBounds = { 
+        x: { min: minX, max: maxX },
+        y: { min: minY, max: maxY },
+        z: { min: minZ, max: maxZ }
+      };
+      
+      // Reset slicer
+      setSliceEnabled(false);
+      setSliceX({ min: 0, max: 100 });
+      setSliceY({ min: 0, max: 100 });
+      setSliceZ({ min: 0, max: 100 });
+      setSliceBoundsX({ min: minX, max: maxX });
+      setSliceBoundsY({ min: minY, max: maxY });
+      setSliceBoundsZ({ min: minZ, max: maxZ });
+      setPointColor('original'); // Reset to original colors
+      setRotationZ(0); // Reset rotation
+
+      const h = data.header;
+      setFileInfo({
+        name: file.name,
+        size: (file.size / 1024 / 1024).toFixed(2),
+        version: `${h.versionMajor}.${h.versionMinor}`,
+        format: h.pointDataRecordFormat,
+        totalPoints: h.numberOfPoints.toLocaleString(),
+        loadedPoints: h.loadedPoints.toLocaleString(),
+        bounds: h.bounds,
+        center: h.center,
+        extentMeters: h.extentMeters
+      });
+
+    } catch (err) {
+      console.error('Parse error:', err);
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [pointSize, opacity]);
+
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    if (file) loadFile(file);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files?.[0];
+    if (file?.name.toLowerCase().endsWith('.las')) loadFile(file);
+  };
+
+  // View controls
+  const viewTop = () => threeRef.current.controls?.viewTop();
+  const viewFront = () => threeRef.current.controls?.viewFront();
+  const viewRight = () => threeRef.current.controls?.viewRight();
+  const viewIsometric = () => threeRef.current.controls?.viewIsometric();
+  
+  const resetView = () => {
+    if (fileInfo && threeRef.current.controls) {
+      const ext = fileInfo.extentMeters;
+      const maxExtent = Math.max(ext.x, ext.y, ext.z);
+      threeRef.current.controls.reset(maxExtent);
+    }
+  };
+
+  const rotateLeft = () => threeRef.current.controls?.rotateLeft();
+  const rotateRight = () => threeRef.current.controls?.rotateRight();
+  const rotateUp = () => threeRef.current.controls?.rotateUp();
+  const rotateDown = () => threeRef.current.controls?.rotateDown();
+
+  return (
+    <div className="flex flex-col h-screen bg-gray-900 text-white">
+      {/* Header */}
+      <div className="bg-gray-800 p-3 border-b border-gray-700 flex items-center justify-between flex-wrap gap-3">
+        <h1 className="text-lg font-bold text-blue-400">LAS Viewer</h1>
+        
+        <div className="flex items-center gap-4 flex-wrap">
+          <label className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded cursor-pointer text-sm">
+            Load LAS
+            <input type="file" accept=".las" onChange={handleFile} className="hidden" />
+          </label>
+
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-gray-400">Size:</span>
+            <input
+              type="range"
+              min="1"
+              max="8"
+              step="0.5"
+              value={pointSize}
+              onChange={(e) => setPointSize(parseFloat(e.target.value))}
+              className="w-20"
+            />
+            <span className="text-sm w-6">{pointSize}</span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-gray-400">Opacity:</span>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              step="5"
+              value={opacity}
+              onChange={(e) => setOpacity(parseInt(e.target.value))}
+              className="w-20"
+            />
+            <span className="text-sm w-8">{opacity}%</span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-gray-400">BG:</span>
+            <button
+              onClick={() => setDarkBackground(!darkBackground)}
+              className={`px-2 py-1 rounded text-xs ${
+                darkBackground ? 'bg-gray-800 text-white border border-gray-600' : 'bg-white text-black border border-gray-400'
+              }`}
+            >
+              {darkBackground ? '⬛' : '⬜'}
+            </button>
+          </div>
+
+          <div className="flex items-center gap-1">
+            <span className="text-sm text-gray-400">Color:</span>
+            <button
+              onClick={() => setPointColor('original')}
+              className={`w-6 h-6 rounded text-xs border-2 ${
+                pointColor === 'original' ? 'border-yellow-400' : 'border-transparent'
+              }`}
+              style={{ background: 'linear-gradient(135deg, #ff0000 25%, #00ff00 50%, #0000ff 75%)' }}
+              title="Original colors"
+            />
+            {[
+              { color: '#ffffff', name: 'White' },
+              { color: '#000000', name: 'Black' },
+              { color: '#ff3333', name: 'Red' },
+              { color: '#33ff33', name: 'Green' },
+              { color: '#3399ff', name: 'Blue' },
+              { color: '#ffff33', name: 'Yellow' },
+              { color: '#ff33ff', name: 'Magenta' },
+              { color: '#33ffff', name: 'Cyan' },
+              { color: '#ff9933', name: 'Orange' },
+              { color: '#9933ff', name: 'Purple' },
+            ].map(({ color, name }) => (
+              <button
+                key={color}
+                onClick={() => setPointColor(color)}
+                className={`w-6 h-6 rounded border-2 ${
+                  pointColor === color ? 'border-yellow-400' : color === '#ffffff' ? 'border-gray-400' : 'border-transparent'
+                }`}
+                style={{ backgroundColor: color }}
+                title={name}
+              />
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={toggleMeasureMode}
+              className={`px-3 py-2 rounded text-sm ${
+                measureMode 
+                  ? 'bg-yellow-600 hover:bg-yellow-700' 
+                  : 'bg-gray-600 hover:bg-gray-500'
+              }`}
+            >
+              📏 Measure {measureMode ? 'ON' : 'OFF'}
+            </button>
+            {measureMode && (
+              <>
+                <div className="flex rounded overflow-hidden text-xs">
+                  <button
+                    onClick={() => setMeasureAxis('3d')}
+                    className={`px-2 py-1 ${measureAxis === '3d' ? 'bg-yellow-600' : 'bg-gray-600 hover:bg-gray-500'}`}
+                  >
+                    3D
+                  </button>
+                  <button
+                    onClick={() => setMeasureAxis('horizontal')}
+                    className={`px-2 py-1 ${measureAxis === 'horizontal' ? 'bg-cyan-600' : 'bg-gray-600 hover:bg-gray-500'}`}
+                  >
+                    Horiz
+                  </button>
+                  <button
+                    onClick={() => setMeasureAxis('vertical')}
+                    className={`px-2 py-1 ${measureAxis === 'vertical' ? 'bg-fuchsia-600' : 'bg-gray-600 hover:bg-gray-500'}`}
+                  >
+                    Vert
+                  </button>
+                </div>
+                <button
+                  onClick={clearMeasurement}
+                  className="px-2 py-2 bg-gray-600 hover:bg-gray-500 rounded text-sm"
+                >
+                  Clear
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Main */}
+      <div className="flex flex-1 overflow-hidden">
+        <div
+          ref={containerRef}
+          className="flex-1 relative"
+          onDrop={handleDrop}
+          onDragOver={(e) => e.preventDefault()}
+          onClick={handleMeasureClick}
+          style={{ cursor: measureMode ? 'crosshair' : 'default' }}
+        >
+          {!fileInfo && !loading && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <div className={`text-center p-6 border-2 border-dashed rounded-lg ${
+                darkBackground ? 'border-gray-600' : 'border-gray-400'
+              }`}>
+                <p className={darkBackground ? 'text-gray-400' : 'text-gray-600'}>Drop LAS file here</p>
+                <p className={`text-sm ${darkBackground ? 'text-gray-500' : 'text-gray-500'}`}>Supports EPSG:4326 (lat/lon + meters Z)</p>
+              </div>
+            </div>
+          )}
+
+          {loading && (
+            <div className={`absolute inset-0 flex items-center justify-center ${
+              darkBackground ? 'bg-black/50' : 'bg-white/50'
+            }`}>
+              <div className="text-center">
+                <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
+                <p className={darkBackground ? 'text-white' : 'text-gray-800'}>Parsing point cloud...</p>
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div className="absolute top-2 left-2 right-2 bg-red-900 border border-red-600 p-2 rounded text-sm">
+              Error: {error}
+              <button onClick={() => setError(null)} className="float-right">✕</button>
+            </div>
+          )}
+
+          {/* Controls help */}
+          <div className={`absolute bottom-2 left-2 p-2 rounded text-xs ${
+            darkBackground ? 'bg-black/80 text-gray-400' : 'bg-white/90 text-gray-600 border border-gray-300'
+          }`}>
+            <div>Left drag: Rotate</div>
+            <div>Right drag: Pan</div>
+            <div>Scroll: Zoom</div>
+            <div>←/→: Pan left/right</div>
+            <div>↑/↓: Pan up/down (Z)</div>
+          </div>
+
+          {/* Measure mode overlay */}
+          {measureMode && (
+            <div className={`absolute top-2 right-2 p-3 rounded text-sm ${
+              darkBackground ? 'bg-black/90' : 'bg-white/95 border border-gray-300'
+            }`} style={{ marginRight: fileInfo ? '288px' : '0' }}>
+              <div className="text-yellow-500 font-semibold mb-2">📏 Measure Mode</div>
+              <div className={`text-xs mb-2 ${
+                measureAxis === '3d' ? 'text-yellow-400' : 
+                measureAxis === 'horizontal' ? 'text-cyan-400' : 'text-fuchsia-400'
+              }`}>
+                {measureAxis === '3d' ? '3D Distance' : 
+                 measureAxis === 'horizontal' ? 'Horizontal (XY) Only' : 'Vertical (Z) Only'}
+              </div>
+              {measurePoints.length === 0 && (
+                <div className={darkBackground ? 'text-gray-300' : 'text-gray-700'}>Click first point</div>
+              )}
+              {measurePoints.length === 1 && (
+                <div className={darkBackground ? 'text-gray-300' : 'text-gray-700'}>Click second point</div>
+              )}
+              {measureDistance !== null && (
+                <div className="mt-2">
+                  <div className={`text-xs ${darkBackground ? 'text-gray-400' : 'text-gray-500'}`}>Distance:</div>
+                  <div className={`text-lg font-mono ${
+                    measureAxis === '3d' ? 'text-yellow-500' : 
+                    measureAxis === 'horizontal' ? 'text-cyan-500' : 'text-fuchsia-500'
+                  }`}>
+                    {measureDistance < 1 
+                      ? `${(measureDistance * 100).toFixed(2)} cm`
+                      : measureDistance < 1000
+                        ? `${measureDistance.toFixed(3)} m`
+                        : `${(measureDistance / 1000).toFixed(3)} km`
+                    }
+                  </div>
+                  <div className={`text-sm font-mono mt-1 ${
+                    measureAxis === '3d' ? 'text-yellow-400' : 
+                    measureAxis === 'horizontal' ? 'text-cyan-400' : 'text-fuchsia-400'
+                  }`}>
+                    {(() => {
+                      const totalFeet = measureDistance * 3.28084;
+                      const feet = Math.floor(totalFeet);
+                      const inches = ((totalFeet - feet) * 12).toFixed(1);
+                      if (totalFeet < 1) {
+                        return `${(measureDistance * 39.3701).toFixed(2)} in`;
+                      } else {
+                        return `${feet}' ${inches}"`;
+                      }
+                    })()}
+                  </div>
+                  <div className={`text-xs mt-1 ${darkBackground ? 'text-gray-500' : 'text-gray-400'}`}>
+                    ({measureDistance.toFixed(4)} m / {(measureDistance * 3.28084).toFixed(4)} ft)
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* View controls */}
+          {fileInfo && (
+            <div className="absolute top-2 left-2 flex flex-col gap-2">
+              {/* View presets */}
+              <div className={`rounded p-2 flex flex-col gap-1 ${
+                darkBackground ? 'bg-black/80' : 'bg-white/90 border border-gray-300'
+              }`}>
+                <span className={`text-xs mb-1 ${darkBackground ? 'text-gray-400' : 'text-gray-600'}`}>Views</span>
+                <div className="grid grid-cols-2 gap-1">
+                  <button onClick={viewTop} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+                    Top
+                  </button>
+                  <button onClick={viewFront} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+                    Front (S)
+                  </button>
+                  <button onClick={viewRight} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+                    Right (W)
+                  </button>
+                  <button onClick={viewIsometric} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+                    Iso
+                  </button>
+                </div>
+                <button onClick={resetView} className="px-2 py-1 bg-blue-700 hover:bg-blue-600 rounded text-xs mt-1">
+                  Reset
+                </button>
+              </div>
+
+              {/* Rotation controls */}
+              <div className={`rounded p-2 ${
+                darkBackground ? 'bg-black/80' : 'bg-white/90 border border-gray-300'
+              }`}>
+                <span className={`text-xs mb-1 block ${darkBackground ? 'text-gray-400' : 'text-gray-600'}`}>Rotate</span>
+                <div className="grid grid-cols-3 gap-1 w-24">
+                  <div></div>
+                  <button onClick={rotateUp} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+                    ↑
+                  </button>
+                  <div></div>
+                  <button onClick={rotateLeft} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+                    ←
+                  </button>
+                  <div></div>
+                  <button onClick={rotateRight} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+                    →
+                  </button>
+                  <div></div>
+                  <button onClick={rotateDown} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+                    ↓
+                  </button>
+                  <div></div>
+                </div>
+              </div>
+
+              {/* Slicer controls */}
+              <div className={`rounded p-2 ${
+                darkBackground ? 'bg-black/80' : 'bg-white/90 border border-gray-300'
+              }`}>
+                <div className="flex items-center justify-between mb-2">
+                  <span className={`text-xs ${darkBackground ? 'text-gray-400' : 'text-gray-600'}`}>Slicer</span>
+                  <button
+                    onClick={() => setSliceEnabled(!sliceEnabled)}
+                    className={`px-2 py-0.5 rounded text-xs ${
+                      sliceEnabled ? 'bg-green-600' : 'bg-gray-600 hover:bg-gray-500'
+                    }`}
+                  >
+                    {sliceEnabled ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+                
+                {sliceEnabled && (
+                  <div className="space-y-2">
+                    {/* X axis */}
+                    <div>
+                      <div className="flex items-center gap-1 mb-1">
+                        <span className="text-xs text-red-400 w-4 font-bold">X</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={sliceX.min}
+                          onChange={(e) => setSliceX(s => ({ ...s, min: Math.min(parseInt(e.target.value), s.max - 1) }))}
+                          className="flex-1 h-1"
+                        />
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={sliceX.max}
+                          onChange={(e) => setSliceX(s => ({ ...s, max: Math.max(parseInt(e.target.value), s.min + 1) }))}
+                          className="flex-1 h-1"
+                        />
+                      </div>
+                      <div className={`text-xs font-mono ${darkBackground ? 'text-gray-500' : 'text-gray-500'}`} style={{ fontSize: '9px' }}>
+                        {(sliceBoundsX.min + (sliceX.min / 100) * (sliceBoundsX.max - sliceBoundsX.min)).toFixed(1)} → {(sliceBoundsX.min + (sliceX.max / 100) * (sliceBoundsX.max - sliceBoundsX.min)).toFixed(1)}m
+                      </div>
+                    </div>
+                    
+                    {/* Y axis */}
+                    <div>
+                      <div className="flex items-center gap-1 mb-1">
+                        <span className="text-xs text-green-400 w-4 font-bold">Y</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={sliceY.min}
+                          onChange={(e) => setSliceY(s => ({ ...s, min: Math.min(parseInt(e.target.value), s.max - 1) }))}
+                          className="flex-1 h-1"
+                        />
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={sliceY.max}
+                          onChange={(e) => setSliceY(s => ({ ...s, max: Math.max(parseInt(e.target.value), s.min + 1) }))}
+                          className="flex-1 h-1"
+                        />
+                      </div>
+                      <div className={`text-xs font-mono ${darkBackground ? 'text-gray-500' : 'text-gray-500'}`} style={{ fontSize: '9px' }}>
+                        {(sliceBoundsY.min + (sliceY.min / 100) * (sliceBoundsY.max - sliceBoundsY.min)).toFixed(1)} → {(sliceBoundsY.min + (sliceY.max / 100) * (sliceBoundsY.max - sliceBoundsY.min)).toFixed(1)}m
+                      </div>
+                    </div>
+                    
+                    {/* Z axis */}
+                    <div>
+                      <div className="flex items-center gap-1 mb-1">
+                        <span className="text-xs text-blue-400 w-4 font-bold">Z</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={sliceZ.min}
+                          onChange={(e) => setSliceZ(s => ({ ...s, min: Math.min(parseInt(e.target.value), s.max - 1) }))}
+                          className="flex-1 h-1"
+                        />
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={sliceZ.max}
+                          onChange={(e) => setSliceZ(s => ({ ...s, max: Math.max(parseInt(e.target.value), s.min + 1) }))}
+                          className="flex-1 h-1"
+                        />
+                      </div>
+                      <div className={`text-xs font-mono ${darkBackground ? 'text-gray-500' : 'text-gray-500'}`} style={{ fontSize: '9px' }}>
+                        {(sliceBoundsZ.min + (sliceZ.min / 100) * (sliceBoundsZ.max - sliceBoundsZ.min)).toFixed(1)} → {(sliceBoundsZ.min + (sliceZ.max / 100) * (sliceBoundsZ.max - sliceBoundsZ.min)).toFixed(1)}m
+                      </div>
+                    </div>
+                    
+                    <button
+                      onClick={() => {
+                        setSliceX({ min: 0, max: 100 });
+                        setSliceY({ min: 0, max: 100 });
+                        setSliceZ({ min: 0, max: 100 });
+                      }}
+                      className="w-full px-1 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-xs mt-1"
+                    >
+                      Reset All
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Data rotation controls */}
+              <div className={`rounded p-2 ${
+                darkBackground ? 'bg-black/80' : 'bg-white/90 border border-gray-300'
+              }`}>
+                <div className="flex items-center justify-between mb-2">
+                  <span className={`text-xs ${darkBackground ? 'text-gray-400' : 'text-gray-600'}`}>Rotate Data (Z)</span>
+                  <span className={`text-xs font-mono ${darkBackground ? 'text-gray-500' : 'text-gray-600'}`}>{rotationZ}°</span>
+                </div>
+                
+                <div className="flex gap-1 mb-1">
+                  <button
+                    onClick={() => setRotationZ(r => r - 10)}
+                    className="flex-1 px-1 py-0.5 bg-gray-600 hover:bg-gray-500 rounded text-xs"
+                  >
+                    -10°
+                  </button>
+                  <button
+                    onClick={() => setRotationZ(r => r - 1)}
+                    className="flex-1 px-1 py-0.5 bg-gray-600 hover:bg-gray-500 rounded text-xs"
+                  >
+                    -1°
+                  </button>
+                  <button
+                    onClick={() => setRotationZ(r => r + 1)}
+                    className="flex-1 px-1 py-0.5 bg-gray-600 hover:bg-gray-500 rounded text-xs"
+                  >
+                    +1°
+                  </button>
+                  <button
+                    onClick={() => setRotationZ(r => r + 10)}
+                    className="flex-1 px-1 py-0.5 bg-gray-600 hover:bg-gray-500 rounded text-xs"
+                  >
+                    +10°
+                  </button>
+                </div>
+                <button
+                  onClick={() => setRotationZ(0)}
+                  className="w-full px-1 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-xs"
+                >
+                  Reset
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Info Panel */}
+        {fileInfo && (
+          <div className="w-72 bg-gray-800 p-3 border-l border-gray-700 text-sm overflow-auto">
+            <h2 className="font-semibold text-blue-400 mb-3">File Info</h2>
+            <div className="space-y-2">
+              <div>
+                <span className="text-gray-400">Name:</span>
+                <div className="text-white break-all">{fileInfo.name}</div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <span className="text-gray-400">Size:</span>
+                  <div>{fileInfo.size} MB</div>
+                </div>
+                <div>
+                  <span className="text-gray-400">Version:</span>
+                  <div>{fileInfo.version}</div>
+                </div>
+              </div>
+              <div>
+                <span className="text-gray-400">Format:</span>
+                <span className="ml-1">{fileInfo.format}</span>
+              </div>
+              <div>
+                <span className="text-gray-400">Total Points:</span>
+                <div>{fileInfo.totalPoints}</div>
+              </div>
+              <div>
+                <span className="text-gray-400">Loaded:</span>
+                <div>{fileInfo.loadedPoints}</div>
+              </div>
+
+              <div className="pt-2 border-t border-gray-700">
+                <span className="text-gray-400">Geographic Bounds:</span>
+                <div className="font-mono text-xs mt-1 bg-gray-900 p-2 rounded">
+                  <div className="text-yellow-400">Lon: {fileInfo.bounds.lon[0].toFixed(6)}°</div>
+                  <div className="text-yellow-400 pl-4">→ {fileInfo.bounds.lon[1].toFixed(6)}°</div>
+                  <div className="text-green-400">Lat: {fileInfo.bounds.lat[0].toFixed(6)}°</div>
+                  <div className="text-green-400 pl-4">→ {fileInfo.bounds.lat[1].toFixed(6)}°</div>
+                  <div className="text-blue-400">Elev: {fileInfo.bounds.z[0].toFixed(2)}m</div>
+                  <div className="text-blue-400 pl-4">→ {fileInfo.bounds.z[1].toFixed(2)}m</div>
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-gray-700">
+                <span className="text-gray-400">Center:</span>
+                <div className="font-mono text-xs mt-1 bg-gray-900 p-2 rounded">
+                  <div>{fileInfo.center.lat.toFixed(6)}°N</div>
+                  <div>{fileInfo.center.lon.toFixed(6)}°E</div>
+                  <div>{fileInfo.center.z.toFixed(2)}m</div>
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-gray-700">
+                <span className="text-gray-400">Extent (meters):</span>
+                <div className="font-mono text-xs mt-1 bg-gray-900 p-2 rounded">
+                  <div>X (E-W): {fileInfo.extentMeters.x.toFixed(2)}m</div>
+                  <div>Y (N-S): {fileInfo.extentMeters.y.toFixed(2)}m</div>
+                  <div>Z (Up): {fileInfo.extentMeters.z.toFixed(2)}m</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
