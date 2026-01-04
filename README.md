@@ -2,6 +2,9 @@
 
 A browser-based LAS point cloud viewer built with React and Three.js. Supports EPSG:4326 (WGS84) coordinate systems with elevation in meters.
 
+Developed based on scans from the [3D Scanner App](https://3dscannerapp.com/) using iOS lidar equiped devices. This was needed to scan complex stormwater junction boxes. 
+This is 99.9% Claude Coded. Feel free to make it better.
+
 ## 🚀 Try It Now
 
 **[Launch Live Viewer](https://geomoff.github.io/Simple-LAS-viewer/)**
@@ -10,6 +13,17 @@ Don't have a LAS file? Try the [sample file](https://github.com/GeoMoff/Simple-L
 
 ![LAS Viewer Screenshot](screenshot.png)
 
+## How to Scan
+
+- **Download 3D Scanner App** iOS, lidar-equiped models required
+- **New Scan > Point Cloud Scan** Point Cloud
+- **After Scan Completed** Share > LAS Geo-Referenced (High Density)
+- **Save /Share File as Required**
+- **Load .LAS into Viewer**
+- **???**
+- **Profit**
+
+  
 ## Features
 
 ### Visualization
@@ -113,3 +127,7 @@ MIT License - See [LICENSE](LICENSE) file for details.
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Limitations
+
+It's free and it's vibe-coded. Don't expect it to be accurate. Don't build anything of value against it. Caveat Emptor and all that. Enjoy!
