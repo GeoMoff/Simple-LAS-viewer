@@ -3,12 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Browser-based LAS point cloud viewer with measurement, slicing, and visualization tools" />
-  <title>LAS Point Cloud Viewer</title>
+  <meta name="description" content="Browser-based LAS/LAZ point cloud viewer with measurement, slicing, and visualization tools" />
+  <title>LAS/LAZ Point Cloud Viewer</title>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/laz-perf@0.0.7/lib/laz-perf.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body, #root { height: 100%; width: 100%; overflow: hidden; }
@@ -356,6 +357,134 @@
       return { r, g, b };
     }
 
+    // LAZ Decompressor using laz-perf
+    let lazPerfModule = null;
+    
+    class LAZDecompressor {
+      static isLazFile(file) {
+        return file.name.toLowerCase().endsWith('.laz');
+      }
+
+      static isLasFile(file) {
+        return file.name.toLowerCase().endsWith('.las');
+      }
+
+      static async initModule() {
+        if (lazPerfModule) return lazPerfModule;
+        
+        if (typeof createLazPerf === 'undefined') {
+          throw new Error('laz-perf library not loaded. Make sure the script is included.');
+        }
+        
+        console.log('Initializing laz-perf WASM module...');
+        lazPerfModule = await createLazPerf();
+        console.log('laz-perf module ready');
+        return lazPerfModule;
+      }
+
+      static async decompress(arrayBuffer) {
+        const laz = await LAZDecompressor.initModule();
+        
+        const compressedData = new Uint8Array(arrayBuffer);
+        const compressedView = new DataView(arrayBuffer);
+        
+        // Read LAZ header to get point count and format
+        const signature = String.fromCharCode(
+          compressedView.getUint8(0),
+          compressedView.getUint8(1),
+          compressedView.getUint8(2),
+          compressedView.getUint8(3)
+        );
+        
+        if (signature !== 'LASF') {
+          throw new Error('Invalid LAZ file - missing LASF signature');
+        }
+
+        const headerSize = compressedView.getUint16(94, true);
+        const pointDataOffset = compressedView.getUint32(96, true);
+        const pointDataFormat = compressedView.getUint8(104);
+        const pointDataLength = compressedView.getUint16(105, true);
+        
+        // Get point count (check for LAS 1.4 extended count)
+        const versionMajor = compressedView.getUint8(24);
+        const versionMinor = compressedView.getUint8(25);
+        let pointCount;
+        
+        if (versionMajor === 1 && versionMinor >= 4) {
+          pointCount = Number(compressedView.getBigUint64(247, true));
+        } else {
+          pointCount = compressedView.getUint32(107, true);
+        }
+
+        console.log(`LAZ: Decompressing ${pointCount.toLocaleString()} points, format ${pointDataFormat}`);
+
+        // Create laz-perf decompressor
+        const laszip = new laz.LASZip();
+        
+        // Open the compressed data
+        const compressedPtr = laz._malloc(compressedData.length);
+        laz.HEAPU8.set(compressedData, compressedPtr);
+        
+        try {
+          laszip.open(compressedPtr, compressedData.length);
+        } catch (e) {
+          laz._free(compressedPtr);
+          throw new Error('Failed to open LAZ file for decompression: ' + e.message);
+        }
+
+        // Get point size from decompressor
+        const decompressedPointSize = laszip.getPointLength();
+        
+        // Allocate buffer for decompressed data
+        const decompressedSize = headerSize + (pointCount * decompressedPointSize);
+        const decompressedBuffer = new ArrayBuffer(decompressedSize);
+        const decompressedArray = new Uint8Array(decompressedBuffer);
+        const decompressedView = new DataView(decompressedBuffer);
+        
+        // Copy header (modifying it for LAS format)
+        decompressedArray.set(new Uint8Array(arrayBuffer, 0, headerSize));
+        
+        // Update header for uncompressed LAS
+        // Set point data offset to right after header
+        decompressedView.setUint32(96, headerSize, true);
+        // Clear compression flag (subtract 128 if format >= 128)
+        if (pointDataFormat >= 128) {
+          decompressedView.setUint8(104, pointDataFormat - 128);
+        }
+        // Set point record length
+        decompressedView.setUint16(105, decompressedPointSize, true);
+        
+        // Allocate point buffer for reading
+        const pointPtr = laz._malloc(decompressedPointSize);
+        
+        // Decompress points
+        let offset = headerSize;
+        for (let i = 0; i < pointCount; i++) {
+          laszip.getPoint(pointPtr);
+          
+          // Copy point data from WASM heap
+          for (let j = 0; j < decompressedPointSize; j++) {
+            decompressedArray[offset + j] = laz.HEAPU8[pointPtr + j];
+          }
+          offset += decompressedPointSize;
+          
+          // Log progress every million points
+          if (i > 0 && i % 1000000 === 0) {
+            console.log(`LAZ: Decompressed ${(i / 1000000).toFixed(1)}M points...`);
+          }
+        }
+        
+        // Cleanup
+        laz._free(pointPtr);
+        laz._free(compressedPtr);
+        laszip.delete();
+        
+        console.log(`LAZ: Decompression complete, ${(decompressedSize / 1024 / 1024).toFixed(2)} MB`);
+        
+        return decompressedBuffer;
+      }
+    }
+
     // Orbit controls for Z-up coordinate system
     class OrbitControls {
       constructor(camera, element) {
@@ -473,6 +602,7 @@
 
       const [fileInfo, setFileInfo] = useState(null);
       const [loading, setLoading] = useState(false);
+      const [loadingStatus, setLoadingStatus] = useState('');
       const [error, setError] = useState(null);
       const [pointSize, setPointSize] = useState(2.0);
       const [opacity, setOpacity] = useState(100);
@@ -905,9 +1035,20 @@
       const loadFile = useCallback(async (file) => {
         setLoading(true);
         setError(null);
+        setLoadingStatus('Reading file...');
 
         try {
-          const buffer = await file.arrayBuffer();
+          let buffer = await file.arrayBuffer();
+          
+          // Decompress if LAZ file
+          if (LAZDecompressor.isLazFile(file)) {
+            setLoadingStatus('Decompressing LAZ file...');
+            console.log('Detected LAZ file, decompressing...');
+            buffer = await LAZDecompressor.decompress(buffer);
+            console.log('LAZ decompression complete');
+          }
+          
+          setLoadingStatus('Parsing point cloud...');
           const parser = new LASParser(buffer, { isGeographic: true });
           const data = parser.parse();
 
@@ -1022,7 +1163,8 @@
       const handleDrop = (e) => {
         e.preventDefault();
         const file = e.dataTransfer.files?.[0];
-        if (file?.name.toLowerCase().endsWith('.las')) loadFile(file);
+        const name = file?.name.toLowerCase();
+        if (name?.endsWith('.las') || name?.endsWith('.laz')) loadFile(file);
       };
 
       const viewTop = () => threeRef.current.controls?.viewTop();
@@ -1046,12 +1188,17 @@
       return (
         <div className="flex flex-col h-screen bg-gray-900 text-white">
           <div className="bg-gray-800 p-3 border-b border-gray-700 flex items-center justify-between flex-wrap gap-3">
-            <h1 className="text-lg font-bold text-blue-400">LAS Viewer</h1>
+            <h1 className="text-lg font-bold text-blue-400">LAS/LAZ Viewer</h1>
             
             <div className="flex items-center gap-4 flex-wrap">
               <label className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded cursor-pointer text-sm">
                 Load LAS
                 <input type="file" accept=".las" onChange={handleFile} className="hidden" />
+              </label>
+
+              <label className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded cursor-pointer text-sm">
+                Load LAZ
+                <input type="file" accept=".laz" onChange={handleFile} className="hidden" />
               </label>
 
               <div className="flex items-center gap-2">
@@ -1115,7 +1262,7 @@
               {!fileInfo && !loading && (
                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                   <div className={`text-center p-6 border-2 border-dashed rounded-lg ${darkBackground ? 'border-gray-600' : 'border-gray-400'}`}>
-                    <p className={darkBackground ? 'text-gray-400' : 'text-gray-600'}>Drop LAS file here</p>
+                    <p className={darkBackground ? 'text-gray-400' : 'text-gray-600'}>Drop LAS or LAZ file here</p>
                     <p className={`text-sm ${darkBackground ? 'text-gray-500' : 'text-gray-500'}`}>Supports EPSG:4326 (lat/lon + meters Z)</p>
                   </div>
                 </div>
@@ -1125,7 +1272,7 @@
                 <div className={`absolute inset-0 flex items-center justify-center ${darkBackground ? 'bg-black/50' : 'bg-white/50'}`}>
                   <div className="text-center">
                     <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
-                    <p className={darkBackground ? 'text-white' : 'text-gray-800'}>Parsing point cloud...</p>
+                    <p className={darkBackground ? 'text-white' : 'text-gray-800'}>{loadingStatus || 'Loading...'}</p>
                   </div>
                 </div>
               )}
