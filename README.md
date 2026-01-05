@@ -20,7 +20,6 @@ Don't have a LAS file? Try the [sample file](https://github.com/GeoMoff/Simple-L
 - **After Scan Completed** Share > LAS Geo-Referenced (High Density)
 - **Save /Share File as Required**
 - **Load .LAS into Viewer**
-- **???**
 - **Profit**
 
   
@@ -73,6 +72,10 @@ Alternatively, use the [live viewer](https://geomoff.github.io/Simple-LAS-viewer
 
 ### Option 2: Development Build
 
+1. Fork this Repo to your profile
+2. Run the operations bellow and install the dependencies
+
+   
 ```bash
 # Clone the repository
 git clone https://github.com/yourusername/las-point-cloud-viewer.git
